@@ -65,104 +65,140 @@ func getProfile() stackProfile {
 	return stackProfile{p, labels}
 }
 
+var sampleRate = 10 * time.Millisecond
+
 func WriteTrace(ctx context.Context, duration time.Duration, w io.Writer) error {
-	var profiles []stackProfile
+	prof := &profile.Profile{
+		DurationNanos: int64(duration),
+		SampleType: []*profile.ValueType{
+			{Type: "samples", Unit: "count"},
+			{Type: "wall", Unit: "nanoseconds"},
+		},
+		Period: int64(sampleRate),
+		PeriodType: &profile.ValueType{
+			Type: "wall",
+			Unit: "nanoseconds",
+		},
+	}
 
-	sampleRate := 10 * time.Millisecond
+	pb := &profileBuilder{
+		prof:          prof,
+		sampleCache:   make(map[[32]uintptr]*profile.Sample),
+		locationCache: make(map[uintptr]*profile.Location),
+		functionCache: make(map[string]*profile.Function),
+	}
 
-	end := time.Now().Add(duration)
+	totalCount := int(duration / sampleRate)
 
-	for {
+	for i := 0; i < totalCount; i++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
 		sleepTo := time.Now().Add(sampleRate)
-		profiles = append(profiles, getProfile())
 
-		if time.Now().After(end) {
-			break
-		}
+		stkProf := getProfile()
+		pb.addProfile(stkProf)
 
 		time.Sleep(time.Until(sleepTo))
 	}
 
-	locCache := make(map[uintptr]*profile.Location)
-	funcCache := make(map[string]*profile.Function)
-	sampCache := make(map[[32]uintptr]*profile.Sample)
-
-	var prof profile.Profile
-
-	prof.DurationNanos = int64(duration)
-
-	prof.SampleType = []*profile.ValueType{
-		{Type: "samples", Unit: "count"},
-		{Type: "wall", Unit: "nanoseconds"},
-	}
-
-	prof.Period = int64(sampleRate)
-	prof.PeriodType = &profile.ValueType{Type: "wall", Unit: "nanoseconds"}
-
-	for _, stackProfile := range profiles {
-		for i := 0; i < stackProfile.Len(); i++ {
-			samp, ok := sampCache[stackProfile.Stack0(i)]
-			if ok {
-				samp.Value[0]++
-				samp.Value[1] += int64(sampleRate)
-				continue
-			}
-
-			samp = &profile.Sample{}
-
-			samp.Value = []int64{1, int64(sampleRate)}
-
-			// label := stackProfile.Label(i)
-			// if label != nil {
-			// 	samp.Label = make(map[string][]string)
-			// 	for k, v := range *label {
-			// 		samp.Label[k] = []string{v}
-			// 	}
-			// }
-
-			frames := runtime.CallersFrames(stackProfile.Stack(i))
-
-			for {
-				frame, more := frames.Next()
-				if !more {
-					break
-				}
-
-				loc, ok := locCache[frame.PC]
-				if !ok {
-					funct, ok := funcCache[frame.Function]
-					if !ok {
-						funct = &profile.Function{
-							ID:   uint64(len(prof.Function) + 1),
-							Name: frame.Function,
-						}
-
-						funcCache[frame.Function] = funct
-						prof.Function = append(prof.Function, funct)
-					}
-
-					loc = &profile.Location{
-						ID:      uint64(len(prof.Location) + 1),
-						Address: uint64(frame.PC),
-						Line:    []profile.Line{{Function: funct, Line: int64(frame.Line)}},
-					}
-
-					locCache[frame.PC] = loc
-					prof.Location = append(prof.Location, loc)
-				}
-
-				samp.Location = append(samp.Location, loc)
-			}
-
-			sampCache[stackProfile.Stack0(i)] = samp
-			prof.Sample = append(prof.Sample, samp)
-		}
-	}
-
 	_ = prof.Write(w)
 	return nil
+}
+
+type profileBuilder struct {
+	prof *profile.Profile
+
+	sampleCache   map[[32]uintptr]*profile.Sample
+	locationCache map[uintptr]*profile.Location
+	functionCache map[string]*profile.Function
+}
+
+func (pb *profileBuilder) addProfile(sProfile stackProfile) {
+	for i := 0; i < sProfile.Len(); i++ {
+		sample, ok := pb.sampleCache[sProfile.Stack0(i)]
+		if ok {
+			sample.Value[0]++
+			sample.Value[1] += int64(sampleRate)
+			continue
+		} else {
+			pb.createSample(sProfile, i)
+		}
+	}
+}
+
+func (pb *profileBuilder) createSample(sProfile stackProfile, i int) {
+	sample := &profile.Sample{}
+
+	sample.Value = []int64{1, int64(sampleRate)}
+
+	// label := stackProfile.Label(i)
+	// if label != nil {
+	// 	sample.Label = make(map[string][]string)
+	// 	for k, v := range *label {
+	// 		sample.Label[k] = []string{v}
+	// 	}
+	// }
+
+	frames := runtime.CallersFrames(sProfile.Stack(i))
+
+	for {
+		frame, more := frames.Next()
+		if !more {
+			// we intentionally ignore the last frame
+			break
+		}
+
+		loc := pb.getOrCreateLocation(&frame)
+		sample.Location = append(sample.Location, loc)
+	}
+
+	pb.sampleCache[sProfile.Stack0(i)] = sample
+	pb.prof.Sample = append(pb.prof.Sample, sample)
+}
+
+func (pb *profileBuilder) getOrCreateLocation(frame *runtime.Frame) *profile.Location {
+	loc, ok := pb.locationCache[frame.PC]
+	if ok {
+		return loc
+	}
+
+	function := pb.getOrCreateFunction(frame.Func, frame.Function, frame.File)
+
+	loc = &profile.Location{
+		ID:      uint64(len(pb.prof.Location) + 1),
+		Address: uint64(frame.PC),
+		Line:    []profile.Line{{Function: function, Line: int64(frame.Line)}},
+	}
+
+	pb.locationCache[frame.PC] = loc
+	pb.prof.Location = append(pb.prof.Location, loc)
+
+	return loc
+}
+
+func (pb *profileBuilder) getOrCreateFunction(f *runtime.Func, name string, filename string) *profile.Function {
+	function, ok := pb.functionCache[name]
+	if ok {
+		return function
+	}
+
+	var startline int
+	if f != nil {
+		filename, startline = f.FileLine(f.Entry())
+	}
+
+	function = &profile.Function{
+		ID:         uint64(len(pb.prof.Function) + 1),
+		Name:       name,
+		SystemName: name,
+		Filename:   filename,
+		StartLine:  int64(startline),
+	}
+
+	pb.functionCache[name] = function
+	pb.prof.Function = append(pb.prof.Function, function)
+
+	return function
 }
