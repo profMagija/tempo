@@ -9,10 +9,10 @@ import (
 )
 
 func init() {
-	http.HandleFunc("/debug/tempo/wall", tempoHandler)
+	http.HandleFunc("/debug/tempo/wall", Wall)
 }
 
-func tempoHandler(w http.ResponseWriter, r *http.Request) {
+func Wall(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	secondsString := r.FormValue("seconds")
 	seconds := 5
